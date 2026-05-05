@@ -28,67 +28,100 @@ Note:
 """
 @nki.jit
 def conv2d_nki(X, W, bias):
-    batch_size, in_channels, input_height, input_width = X.shape
-    out_channels, in_channels_, filter_height, filter_width = W.shape
-    out_channels_ = bias.shape[0]
+    N, C, IH, IW = X.shape
+    K, C_, A, B = W.shape
+    K_ = bias.shape[0]
 
-    out_height = input_height - filter_height + 1
-    out_width = input_width - filter_width + 1
+    OH = IH - A + 1
+    OW = IW - B + 1
 
-    assert filter_height == filter_width, "Filter height must be equal to filter width"
-    assert in_channels % 128 == 0, "Input channels must be divisible by 128"
-    assert out_channels % 128 == 0, "Output channels must be divisible by 128"
-    assert out_width * out_height % 512 == 0, "Output width * output height must be divisible by 512"
+    assert A == B, "Filter height must be equal to filter width"
+    assert C % 128 == 0, "Input channels must be divisible by 128"
+    assert K % 128 == 0, "Output channels must be divisible by 128"
+    assert OW * OH % 512 == 0, "Output width * output height must be divisible by 512"
 
-    # Initialize output array
-    X_out = nl.ndarray(
-        shape=(batch_size, out_channels, out_height, out_width),
+    out = nl.ndarray(
+        shape=(N, K, OH, OW),
         dtype=X.dtype,
         buffer=nl.hbm,
     )
 
-    # Tiling deminsions
-    c_in_tile = nl.tile_size.pmax   # The partition dimension (for SBUF and Tensor Engine) = 128
-    c_out_tile = nl.tile_size.gemm_stationary_fmax   # The width of the Tensor Engine = 128
-    n_tiles_c_in = in_channels // c_in_tile
-    n_tiles_c_out = out_channels // c_out_tile
+    # Tile over output spatial dims (OH, OW). Target TH=16, TW=32
+    OH_f2 = 0
+    t = OH
+    while t % 2 == 0:
+        OH_f2 += 1
+        t //= 2
+    OW_f2 = 0
+    t = OW
+    while t % 2 == 0:
+        OW_f2 += 1
+        t //= 2
+    TH = 2 ** min(max(4, 9 - OW_f2), OH_f2)
+    TW = 2 ** min(max(5, 9 - OH_f2), OW_f2)
+    TC = nl.tile_size.pmax
+    TK = nl.tile_size.gemm_stationary_fmax
 
-    # Load in the weights into the SBUF, aranged for matmuls
-    w = nl.ndarray(
-        shape=(c_in_tile, c_out_tile, n_tiles_c_out, n_tiles_c_in, filter_height, filter_width),
-        dtype=W.dtype,
-        buffer=nl.sbuf
-    )
-    for c_out_tile_idx in nl.affine_range(n_tiles_c_out):
-        for c_in_tile_idx in nl.affine_range(n_tiles_c_in):
-            for i in nl.affine_range(filter_height):
-                for j in nl.affine_range(filter_width):
-                    # 1. Load the weight tile for the current input and output channel tiles idx and filter position
-                    # 2. Store it in the w array at the correct location and orientation
-                    # YOUR CODE HERE
+    for n in nl.affine_range(N):
+        for th in nl.affine_range(OH // TH):
+            for tw in nl.affine_range(OW // TW):
+                for tk in nl.affine_range(K // TK):
+                    # input halo ping pong buffers
+                    halo_buf = [
+                        nl.ndarray(shape=(TC, TH + A - 1, TW + B - 1), dtype=X.dtype, buffer=nl.sbuf),
+                        nl.ndarray(shape=(TC, TH + A - 1, TW + B - 1), dtype=X.dtype, buffer=nl.sbuf),
+                    ]
+            
+                    # psum buffer
+                    psum_tile = nl.zeros(shape=(TK, TH * TW), dtype=nl.float32, buffer=nl.psum)
 
-    # Process the images one-by-one
-    for img in nl.affine_range(batch_size):
-        # Process each output channel tile
-        for c_out_tile_idx in nl.affine_range(n_tiles_c_out):
-            # Convolve: for each output row, convolve over the input channel tiles and filter positions
-            for out_row in nl.affine_range(out_height):
-                # Assign PSUM buffer to accumulate output row
-                # YOUR CODE HERE
+                    # packed filter ping pong buffers (ready for GEMM)
+                    w_tile = [
+                        [nl.ndarray(shape=(TC, TK), dtype=X.dtype, buffer=nl.sbuf) for _ in range(B)]
+                        for _ in range(A)
+                    ]
 
-                # Loop over the input channel tiles and filter positions, accumulating the output row
-                for c_in_tile_idx in nl.affine_range(n_tiles_c_in):
-                    for i in nl.affine_range(filter_height):
-                        for j in nl.affine_range(filter_width):
-                            # 1. Select the weight tile for the current input and output channel tiles idx and filter position
-                            # 2. Load the input tile for the current input channel tile idx, output row, filter position
-                            # 3. Matmul the weight tile and input tile, and accumulate the result in row_out
-                            # YOUR CODE HERE
+                    # raw filter weights, (TK, TC, A, B), TK on P
+                    w_raw = nl.ndarray(shape=(TK, TC, A, B), dtype=X.dtype, buffer=nl.sbuf)
 
-                # Load and add the bias to the row_out based on the current output channel tile idx
-                # YOUR CODE HERE
 
-                # Store the output  
-                # YOUR CODE HERE
+                    # prime
+                    nisa.dma_copy(dst=halo_buf[0], src=X[n, 0:TC, 
+                                                th * TH : th * TH + TH + A - 1, 
+                                                tw * TW : tw * TW + TW + B - 1])
+                    for tc in nl.static_range(C // TC):
+                        # prefetch
+                        if tc < (C // TC) - 1:
+                            nisa.dma_copy(dst=halo_buf[(tc + 1) % 2], src=X[n, (tc + 1) * TC:(tc + 2) * TC, th * TH : th * TH + TH + A - 1, tw * TW : tw * TW + TW + B - 1])
+                        
+                        # load filter
+                        w_raw[...] = nl.load(W[tk * TK:(tk + 1) * TK, tc * TC:(tc + 1) * TC, :, :])
+                        for a in nl.static_range(A):
+                            for b in nl.static_range(B):
+                                w_tile[a][b][...] = nisa.nc_transpose(w_raw[:, :, a, b])
 
-    return X_out
+                        # compute loop
+                        for a in nl.static_range(A):
+                            for b in nl.static_range(B):
+                                # pack the halo JIT
+                                local_pack = nl.copy(
+                                    halo_buf[tc % 2][:, a:a + TH, b:b + TW]
+                                ).reshape((TC, TH * TW))
+
+                                # big iron
+                                psum_tile[...] += nisa.nc_matmul(
+                                    w_tile[a][b], 
+                                    local_pack
+                                )
+
+                    # add bias
+                    b_tile = nl.load(bias[tk * TK:(tk + 1) * TK])
+                    psum_tile[...] = nl.add(psum_tile, b_tile)
+                    
+                    # write back result
+                    nisa.dma_copy(
+                        dst=out[n, tk * TK:(tk + 1) * TK, th * TH:(th + 1) * TH, tw * TW:(tw + 1) * TW], 
+                        src=nl.copy(psum_tile).reshape((TK, TH, TW))
+                    )
+
+    return out
