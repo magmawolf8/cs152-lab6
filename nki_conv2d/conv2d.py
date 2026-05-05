@@ -46,82 +46,72 @@ def conv2d_nki(X, W, bias):
         buffer=nl.hbm,
     )
 
-    # Tile over output spatial dims (OH, OW). Target TH=16, TW=32
-    OH_f2 = 0
-    t = OH
-    while t % 2 == 0:
-        OH_f2 += 1
-        t //= 2
+    # tile over output spatial dims (OH, OW)
     OW_f2 = 0
     t = OW
     while t % 2 == 0:
         OW_f2 += 1
         t //= 2
-    TH = 2 ** min(max(4, 9 - OW_f2), OH_f2)
-    TW = 2 ** min(max(5, 9 - OH_f2), OW_f2)
+    TW = 2 ** OW_f2
+    TH = 512 // TW
     TC = nl.tile_size.pmax
     TK = nl.tile_size.gemm_stationary_fmax
 
     for n in nl.affine_range(N):
         for th in nl.affine_range(OH // TH):
             for tw in nl.affine_range(OW // TW):
-                for tk in nl.affine_range(K // TK):
-                    # input halo ping pong buffers
-                    halo_buf = [
-                        nl.ndarray(shape=(TC, TH + A - 1, TW + B - 1), dtype=X.dtype, buffer=nl.sbuf),
-                        nl.ndarray(shape=(TC, TH + A - 1, TW + B - 1), dtype=X.dtype, buffer=nl.sbuf),
-                    ]
-            
-                    # psum buffer
-                    psum_tile = nl.zeros(shape=(TK, TH * TW), dtype=nl.float32, buffer=nl.psum)
+                # allocate psum tiles
+                NUM_TK = K // TK
+                psum_tiles = [nl.zeros(shape=(TK, TH * TW), dtype=nl.float32, buffer=nl.psum) for _ in range(NUM_TK)]
 
-                    # packed filter ping pong buffers (ready for GEMM)
-                    w_tile = [
-                        [nl.ndarray(shape=(TC, TK), dtype=X.dtype, buffer=nl.sbuf) for _ in range(B)]
-                        for _ in range(A)
-                    ]
+                # input halo ping pong buffers
+                halo_buf = [
+                    nl.ndarray(shape=(TC, TH + A - 1, TW + B - 1), dtype=X.dtype, buffer=nl.sbuf),
+                    nl.ndarray(shape=(TC, TH + A - 1, TW + B - 1), dtype=X.dtype, buffer=nl.sbuf),
+                ]
 
-                    # raw filter weights, (TK, TC, A, B), TK on P
-                    w_raw = nl.ndarray(shape=(TK, TC, A, B), dtype=X.dtype, buffer=nl.sbuf)
+                # one w_tile_buf 
+                w_tile_bufs = [nl.ndarray(shape=(TC, TK), dtype=X.dtype, buffer=nl.sbuf) for _ in range(NUM_TK)]
 
+                # prime X
+                nisa.dma_copy(dst=halo_buf[0], src=X[n, 0:TC, 
+                                            th * TH : th * TH + TH + A - 1, 
+                                            tw * TW : tw * TW + TW + B - 1])
 
-                    # prime
-                    nisa.dma_copy(dst=halo_buf[0], src=X[n, 0:TC, 
-                                                th * TH : th * TH + TH + A - 1, 
-                                                tw * TW : tw * TW + TW + B - 1])
-                    for tc in nl.static_range(C // TC):
-                        # prefetch
-                        if tc < (C // TC) - 1:
-                            nisa.dma_copy(dst=halo_buf[(tc + 1) % 2], src=X[n, (tc + 1) * TC:(tc + 2) * TC, th * TH : th * TH + TH + A - 1, tw * TW : tw * TW + TW + B - 1])
-                        
-                        # load filter
-                        w_raw[...] = nl.load(W[tk * TK:(tk + 1) * TK, tc * TC:(tc + 1) * TC, :, :])
-                        for a in nl.static_range(A):
-                            for b in nl.static_range(B):
-                                w_tile[a][b][...] = nisa.nc_transpose(w_raw[:, :, a, b])
+                for tc in nl.static_range(C // TC):
+                    # prefetch X
+                    if tc < (C // TC) - 1:
+                        nisa.dma_copy(dst=halo_buf[(tc + 1) % 2], src=X[n, (tc + 1) * TC:(tc + 2) * TC, th * TH : th * TH + TH + A - 1, tw * TW : tw * TW + TW + B - 1])
+                    
+                    # load all W for this tc
+                    w_raws = [nl.load(W[tk_idx * TK:(tk_idx + 1) * TK, tc * TC:(tc + 1) * TC, :, :]) for tk_idx in range(NUM_TK)]
 
-                        # compute loop
-                        for a in nl.static_range(A):
-                            for b in nl.static_range(B):
-                                # pack the halo JIT
-                                local_pack = nl.copy(
-                                    halo_buf[tc % 2][:, a:a + TH, b:b + TW]
-                                ).reshape((TC, TH * TW))
+                    # compute loop
+                    for a in nl.static_range(A):
+                        for b in nl.static_range(B):
+                            # pack the halo
+                            local_pack = nl.copy(
+                                halo_buf[tc % 2][:, a:a + TH, b:b + TW]
+                            ).reshape((TC, TH * TW))
 
-                                # big iron
-                                psum_tile[...] += nisa.nc_matmul(
-                                    w_tile[a][b], 
+                            for tk_idx in nl.static_range(NUM_TK):
+                                # transpose JIT
+                                w_tile_bufs[tk_idx][...] = nisa.nc_transpose(w_raws[tk_idx][:, :, a, b])
+
+                                # perform matmul
+                                psum_tiles[tk_idx][...] += nisa.nc_matmul(
+                                    w_tile_bufs[tk_idx], 
                                     local_pack
                                 )
 
-                    # add bias
-                    b_tile = nl.load(bias[tk * TK:(tk + 1) * TK])
-                    psum_tile[...] = nl.add(psum_tile, b_tile)
+                # add bias and write back result
+                for tk_idx in nl.static_range(NUM_TK):
+                    b_tile = nl.load(bias[tk_idx * TK:(tk_idx + 1) * TK])
+                    psum_tiles[tk_idx][...] = nl.add(psum_tiles[tk_idx], b_tile)
                     
-                    # write back result
                     nisa.dma_copy(
-                        dst=out[n, tk * TK:(tk + 1) * TK, th * TH:(th + 1) * TH, tw * TW:(tw + 1) * TW], 
-                        src=nl.copy(psum_tile).reshape((TK, TH, TW))
+                        dst=out[n, tk_idx * TK:(tk_idx + 1) * TK, th * TH:(th + 1) * TH, tw * TW:(tw + 1) * TW], 
+                        src=nl.copy(psum_tiles[tk_idx]).reshape((TK, TH, TW))
                     )
 
     return out
